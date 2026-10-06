@@ -1,0 +1,302 @@
+---
+name: Build Windows legacy AMF HEVC 10-bit
+permissions: {}
+
+on:
+  workflow_dispatch:
+
+env:
+  MSYS2_PATH_TYPE: inherit
+
+jobs:
+  build-windows-amd64:
+    name: Windows-AMD64
+    runs-on: windows-2022
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Resolve latest upstream release
+        id: latest-release
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $headers = @{
+            Accept = 'application/vnd.github+json'
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            'X-GitHub-Api-Version' = '2022-11-28'
+            'User-Agent' = 'YUeH885-Sunshine-build'
+          }
+          $release = Invoke-RestMethod `
+            -Uri 'https://api.github.com/repos/LizardByte/Sunshine/releases/latest' `
+            -Headers $headers
+          if ($release.draft -or $release.prerelease) {
+            throw 'The upstream latest release must be published and stable.'
+          }
+          if ($release.tag_name -notmatch '^v\d{4}\.\d+\.\d+$') {
+            throw "Unexpected upstream release tag: $($release.tag_name)"
+          }
+          "tag=$($release.tag_name)" >> $env:GITHUB_OUTPUT
+
+      - name: Resolve upstream build-deps commit
+        id: build-deps
+        shell: pwsh
+        env:
+          SUNSHINE_TAG: ${{ steps.latest-release.outputs.tag }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $headers = @{
+            Accept = 'application/vnd.github+json'
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            'X-GitHub-Api-Version' = '2022-11-28'
+            'User-Agent' = 'YUeH885-Sunshine-build'
+          }
+          $submodule = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/LizardByte/Sunshine/contents/third-party/build-deps?ref=$env:SUNSHINE_TAG" `
+            -Headers $headers
+          if ($submodule.type -ne 'submodule' -or $submodule.sha -notmatch '^[0-9a-f]{40}$') {
+            throw "Could not resolve the build-deps submodule for $env:SUNSHINE_TAG"
+          }
+          "commit=$($submodule.sha)" >> $env:GITHUB_OUTPUT
+
+      - name: Checkout upstream release and pinned submodules
+        id: release-checkout
+        shell: bash
+        env:
+          SUNSHINE_TAG: ${{ steps.latest-release.outputs.tag }}
+          BUILD_DEPS_COMMIT: ${{ steps.build-deps.outputs.commit }}
+        run: |
+          set -euo pipefail
+          git config --global core.longpaths true
+          git remote add upstream https://github.com/LizardByte/Sunshine.git
+          git -c protocol.version=2 fetch --no-tags upstream "+refs/tags/${SUNSHINE_TAG}:refs/tags/${SUNSHINE_TAG}"
+          git checkout --detach "$SUNSHINE_TAG"
+          git submodule sync --recursive
+          git -c protocol.version=2 submodule update --init --force --recursive --jobs 1
+          test "$(git -C third-party/build-deps rev-parse HEAD)" = "$BUILD_DEPS_COMMIT"
+          git -C third-party/build-deps fetch --tags --depth=1
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "build_deps_tag=$(git -C third-party/build-deps describe --tags --exact-match)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup dotnet
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68  # v6.0.0
+        with:
+          dotnet-version: '10.x'
+
+      - name: Setup MSYS2 UCRT64
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e  # v2.33.0
+        with:
+          msystem: UCRT64
+          update: true
+          # Static Qt's system libraries are build dependencies of qt6-static and require explicit installation.
+          install: >-
+            git
+            make
+            pkg-config
+            python
+            wget
+            mingw-w64-ucrt-x86_64-boost
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-cppwinrt
+            mingw-w64-ucrt-x86_64-curl-winssl
+            mingw-w64-ucrt-x86_64-dbus
+            mingw-w64-ucrt-x86_64-freetype
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-harfbuzz
+            mingw-w64-ucrt-x86_64-libpng
+            mingw-w64-ucrt-x86_64-libtiff
+            mingw-w64-ucrt-x86_64-MinHook
+            mingw-w64-ucrt-x86_64-miniupnpc
+            mingw-w64-ucrt-x86_64-nlohmann-json
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-onevpl
+            mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-opus
+            mingw-w64-ucrt-x86_64-pcre2
+            mingw-w64-ucrt-x86_64-qt6-static
+            mingw-w64-ucrt-x86_64-toolchain
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: lts/*
+
+      - name: Resolve matching FFmpeg archive checksum
+        id: ffmpeg-release
+        shell: pwsh
+        env:
+          BUILD_DEPS_TAG: ${{ steps.release-checkout.outputs.build_deps_tag }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $headers = @{
+            Accept = 'application/vnd.github+json'
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            'X-GitHub-Api-Version' = '2022-11-28'
+            'User-Agent' = 'YUeH885-Sunshine-build'
+          }
+          $release = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/LizardByte/build-deps/releases/tags/$env:BUILD_DEPS_TAG" `
+            -Headers $headers
+          $asset = $release.assets | Where-Object { $_.name -eq 'Windows-AMD64-ffmpeg.tar.gz' }
+          if (-not $asset) {
+            throw "Could not resolve the Windows FFmpeg archive for $env:BUILD_DEPS_TAG"
+          }
+          $digest = [regex]::Match([string]$asset.digest, '^sha256:([0-9a-f]{64})$')
+          if (-not $digest.Success) {
+            throw "The Windows FFmpeg archive has no SHA-256 digest for $env:BUILD_DEPS_TAG"
+          }
+          "sha256=$($digest.Groups[1].Value)" >> $env:GITHUB_OUTPUT
+
+      - name: Node.js Path
+        shell: pwsh
+        run: |
+          $NODEJS_BINARY_PATH = (Get-Command node).Source
+          $NODEJS_PATH = Split-Path -Path "$NODEJS_BINARY_PATH" -Parent
+          "NODEJS_PATH=$NODEJS_PATH" >> $env:GITHUB_ENV
+
+      - name: Download and patch legacy FFmpeg
+        env:
+          SUNSHINE_TAG: ${{ steps.latest-release.outputs.tag }}
+          BUILD_DEPS_TAG: ${{ steps.release-checkout.outputs.build_deps_tag }}
+          FFMPEG_SHA256: ${{ steps.ffmpeg-release.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+
+          wget -q \
+            "https://github.com/LizardByte/build-deps/releases/download/${BUILD_DEPS_TAG}/Windows-AMD64-ffmpeg.tar.gz" \
+            -O ffmpeg.tar.gz
+          echo "${FFMPEG_SHA256}  ffmpeg.tar.gz" | sha256sum --check
+          mkdir -p ffmpeg-dist
+          tar -xzf ffmpeg.tar.gz -C ffmpeg-dist
+          FFMPEG_DIR="$PWD/ffmpeg-dist/ffmpeg"
+          test -f "$FFMPEG_DIR/lib/libavcodec.a"
+
+          python - <<'PY'
+          from pathlib import Path
+
+          source_path = Path("third-party/build-deps/third-party/FFmpeg/FFmpeg/libavcodec/amfenc.c")
+          source = source_path.read_text()
+          check = (
+              "    if (pix_fmt == AV_PIX_FMT_P010) {\n"
+              "        AMF_RETURN_IF_FALSE(ctx, amf_device_ctx->version >= AMF_MAKE_FULL_VERSION(1, 4, 32, 0), AVERROR_UNKNOWN, \"10-bit encoder is not supported by AMD GPU drivers versions lower than 23.30.\\n\");\n"
+              "    }\n\n"
+          )
+          if source.count(check) != 1:
+              raise SystemExit("Expected exactly one old AMF P010 version check")
+          source_path.write_text(source.replace(check, "", 1))
+          PY
+
+          gcc -c -O3 -DNDEBUG -DHAVE_AV_CONFIG_H -w -std=gnu17 \
+            -Ithird-party/build-deps/third-party/FFmpeg/FFmpeg \
+            -I"$FFMPEG_DIR/include" \
+            -I"$FFMPEG_DIR/include/libavcodec" \
+            -Ithird-party/build-deps/third-party/FFmpeg/AMF/amf/public/include \
+            third-party/build-deps/third-party/FFmpeg/FFmpeg/libavcodec/amfenc.c \
+            -o amfenc.o
+
+          test "$(ar t "$FFMPEG_DIR/lib/libavcodec.a" | awk '$0 == "amfenc.o" { count++ } END { print count + 0 }')" = 1
+          ar rs "$FFMPEG_DIR/lib/libavcodec.a" amfenc.o
+          strings "$FFMPEG_DIR/lib/libavcodec.a" > ffmpeg-strings.txt
+          if grep -Fq "10-bit encoder is not supported by AMD GPU drivers" ffmpeg-strings.txt; then
+            echo "AMF P010 version check is still present in libavcodec.a" >&2
+            exit 1
+          fi
+          echo "FFMPEG_DIR=$(cygpath -m "$FFMPEG_DIR")" >> "$GITHUB_ENV"
+
+      - name: Configure legacy Sunshine
+        env:
+          BRANCH: master
+          BUILD_VERSION: ${{ steps.latest-release.outputs.tag }}
+          COMMIT: ${{ steps.release-checkout.outputs.commit }}
+        run: |
+          set -euo pipefail
+          NODEJS_PATH=$(cygpath "$NODEJS_PATH")
+          export PATH="$PATH:$NODEJS_PATH"
+          cmake \
+            -B cmake-build-amf-hevc-10bit \
+            -G Ninja \
+            -S . \
+            -DBUILD_DOCS=OFF \
+            -DBUILD_TESTS=OFF \
+            -DBUILD_WERROR=ON \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DFFMPEG_PREPARED_BINARIES="$FFMPEG_DIR" \
+            -DSUNSHINE_ASSETS_DIR=assets \
+            -DSUNSHINE_PUBLISHER_NAME="${GITHUB_REPOSITORY_OWNER}" \
+            -DSUNSHINE_PUBLISHER_WEBSITE="https://app.lizardbyte.dev" \
+            -DSUNSHINE_PUBLISHER_ISSUE_URL="https://app.lizardbyte.dev/support"
+
+      - name: Build legacy Sunshine
+        run: |
+          set -euo pipefail
+          NODEJS_PATH=$(cygpath "$NODEJS_PATH")
+          export PATH="$PATH:$NODEJS_PATH"
+          cmake --build cmake-build-amf-hevc-10bit --parallel
+
+      - name: Check legacy AMF Windows binaries
+        run: |
+          set -euo pipefail
+          binaries=(
+            cmake-build-amf-hevc-10bit/sunshine.exe
+            cmake-build-amf-hevc-10bit/tools/audio-info.exe
+            cmake-build-amf-hevc-10bit/tools/dxgi-info.exe
+            cmake-build-amf-hevc-10bit/tools/sunshinesvc.exe
+          )
+
+          for binary in "${binaries[@]}"; do
+            echo "::group::ldd ${binary}"
+            linkage="$(ldd "$binary")"
+            echo "$linkage"
+            echo "::endgroup::"
+            unexpected_deps="$(awk '
+              BEGIN { IGNORECASE = 1 }
+              $0 ~ /=>[[:space:]]+not found/ { print; next }
+              $1 == "zlib1.dll" { next }
+              $1 ~ /^api-ms-win-/ { next }
+              $1 ~ /^ext-ms-win-/ { next }
+              $0 ~ /=>[[:space:]]+\/(clangarm64|clang64|mingw32|mingw64|ucrt64)\/bin\// { print }
+            ' <<< "$linkage")"
+            if [[ -n "$unexpected_deps" ]]; then
+              echo "Unexpected non-packaged runtime dependencies in ${binary}:" >&2
+              echo "$unexpected_deps" >&2
+              exit 1
+            fi
+          done
+
+          strings cmake-build-amf-hevc-10bit/sunshine.exe > sunshine-strings.txt
+          if grep -Fq "10-bit encoder is not supported by AMD GPU drivers" sunshine-strings.txt; then
+            echo "AMF P010 version check is still present in sunshine.exe" >&2
+            exit 1
+          fi
+
+      - name: Package Windows legacy AMF build
+        env:
+          SUNSHINE_TAG: ${{ steps.latest-release.outputs.tag }}
+        working-directory: cmake-build-amf-hevc-10bit
+        run: |
+          set -euo pipefail
+          ./sunshine.exe --version | tee sunshine-version.txt
+          grep -Fq "Sunshine version: ${SUNSHINE_TAG#v}" sunshine-version.txt
+          cpack -G WIX --config ./CPackConfig.cmake
+          cpack -G ZIP --config ./CPackConfig.cmake
+          mkdir -p ../artifacts
+          mv ./cpack_artifacts/Sunshine.msi ../artifacts/Sunshine-Windows-AMD64-Legacy-AMF-HEVC-10bit.msi
+          mv ./cpack_artifacts/Sunshine.zip ../artifacts/Sunshine-Windows-AMD64-Legacy-AMF-HEVC-10bit.zip
+
+      - name: Upload legacy AMF artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: Sunshine-Windows-AMD64-Legacy-AMF-HEVC-10bit
+          path: |
+            artifacts/Sunshine-Windows-AMD64-Legacy-AMF-HEVC-10bit.msi
+            artifacts/Sunshine-Windows-AMD64-Legacy-AMF-HEVC-10bit.zip
+          if-no-files-found: error
